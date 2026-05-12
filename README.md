@@ -45,7 +45,7 @@ make server
 
 `make server` runs `server.py` through `run_server.py`, a small foreground supervisor that restarts the server if it exits.
 Use `python3 run_server.py --host <host> --port <port>` when the process must bind somewhere different from `DBLP_SERVER`.
-At startup, the server logs its bind address and database paths, checks for the SQLite index, and runs one update before serving if the index is missing. Each update removes stale `.*.tmp*` files from the XML and index directories before downloading or rebuilding, then prepares the gzip file used by client pulls.
+At startup, the server logs its bind address and database paths, checks for the SQLite index, and runs one update before serving if the index is missing. Each update removes stale `.*.tmp*` files from the XML and index directories before downloading or rebuilding.
 
 Server endpoints:
 
@@ -53,7 +53,7 @@ Server endpoints:
 - `GET /query?q=<title>&limit=10`: query publications and return Alfred-compatible JSON items.
 - `POST /update`: manually trigger a DBLP mirror update.
 - `GET /index/metadata`: metadata for the downloadable SQLite index.
-- `GET /index.gz`: download the prepared gzip-compressed SQLite index.
+- `GET /index.gz`: stream the completed SQLite index as gzip.
 
 The scheduled update downloads DBLP XML to a temporary file, builds a temporary SQLite index, and atomically replaces the live XML/index only after the full build succeeds.
 

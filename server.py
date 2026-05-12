@@ -16,7 +16,7 @@ import time
 import traceback
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, BinaryIO, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from config import CONFIG
 
@@ -54,7 +54,6 @@ class DblpService:
     ) -> None:
         self.xml_path = xml_path
         self.index_path = index_path
-        self.compressed_index_path = f"{index_path}.gz"
         self.token = token
         self.update_hour = update_hour
         self.lock = threading.RLock()
@@ -138,7 +137,6 @@ class DblpService:
             if not os.path.exists(self.index_path):
                 raise FileNotFoundError(self.index_path)
             stat_result = os.stat(self.index_path)
-            compressed_stat_result = os.stat(self.compressed_index_path) if os.path.exists(self.compressed_index_path) else None
             connection = sqlite3.connect(f"file:{urllib.parse.quote(os.path.abspath(self.index_path))}?mode=ro", uri=True)
             try:
                 metadata = dblp.read_index_metadata(connection)
@@ -150,70 +148,20 @@ class DblpService:
                 "index_path": self.index_path,
                 "index_size": stat_result.st_size,
                 "index_mtime_ns": stat_result.st_mtime_ns,
-                "compressed_index_path": self.compressed_index_path,
-                "compressed_index_size": compressed_stat_result.st_size if compressed_stat_result else None,
-                "compressed_index_mtime_ns": compressed_stat_result.st_mtime_ns if compressed_stat_result else None,
                 "schema_version": dblp.INDEX_SCHEMA_VERSION,
                 "metadata": metadata,
                 "record_count": record_count,
             }
 
-    def open_compressed_index(self) -> Tuple[BinaryIO, Dict[str, Any]]:
+    def stream_compressed_index(self, output) -> None:
         with self.lock:
-            if not os.path.exists(self.compressed_index_path):
-                raise FileNotFoundError(self.compressed_index_path)
-            source = open(self.compressed_index_path, "rb")
-            try:
-                stat_result = os.fstat(source.fileno())
-                metadata = {
-                    "path": self.compressed_index_path,
-                    "size": stat_result.st_size,
-                    "mtime_ns": stat_result.st_mtime_ns,
-                }
-            except Exception:
-                source.close()
-                raise
-            return source, metadata
-
-    def compressed_index_is_current(self) -> bool:
-        return (
-            os.path.exists(self.compressed_index_path)
-            and os.path.getmtime(self.compressed_index_path) >= os.path.getmtime(self.index_path)
-        )
-
-    def create_compressed_index(self, source_index_path: str, destination_path: str) -> None:
-        compressed_dir = os.path.dirname(os.path.abspath(destination_path)) or "."
-        os.makedirs(compressed_dir, exist_ok=True)
-        fd, tmp_compressed = tempfile.mkstemp(
-            prefix=f".{os.path.basename(destination_path)}.",
-            suffix=".tmp",
-            dir=compressed_dir,
-        )
-        os.close(fd)
-
-        try:
-            with open(source_index_path, "rb") as source, gzip.open(tmp_compressed, "wb", compresslevel=6) as compressed:
-                while True:
-                    chunk = source.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    compressed.write(chunk)
-            os.replace(tmp_compressed, destination_path)
-        finally:
-            try:
-                os.unlink(tmp_compressed)
-            except FileNotFoundError:
-                pass
-
-    def ensure_compressed_index(self) -> None:
-        if not os.path.exists(self.index_path):
-            raise FileNotFoundError(self.index_path)
-        if self.compressed_index_is_current():
-            log(f"Compressed DBLP index exists: {self.compressed_index_path}")
-            return
-        log(f"Creating compressed DBLP index: {self.compressed_index_path}")
-        self.create_compressed_index(self.index_path, self.compressed_index_path)
-        log(f"Compressed DBLP index ready: {self.compressed_index_path}")
+            source = open(self.index_path, "rb")
+        with source, gzip.GzipFile(fileobj=output, mode="wb", compresslevel=6) as compressed:
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                compressed.write(chunk)
 
     def update_once(self) -> Dict[str, Any]:
         started = datetime.now()
@@ -238,14 +186,8 @@ class DblpService:
             suffix=".tmp",
             dir=index_dir,
         )
-        compressed_fd, tmp_compressed = tempfile.mkstemp(
-            prefix=f".{os.path.basename(self.compressed_index_path)}.",
-            suffix=".tmp",
-            dir=index_dir,
-        )
         os.close(xml_fd)
         os.close(index_fd)
-        os.close(compressed_fd)
 
         try:
             log(f"Starting DBLP update: xml={self.xml_path}, index={self.index_path}")
@@ -258,14 +200,10 @@ class DblpService:
             finally:
                 connection.close()
 
-            log(f"Creating compressed DBLP index: {self.compressed_index_path}")
-            self.create_compressed_index(tmp_index, tmp_compressed)
-
             with self.lock:
                 dblp.remove_sqlite_sidecars(self.index_path)
                 os.replace(tmp_xml, self.xml_path)
                 os.replace(tmp_index, self.index_path)
-                os.replace(tmp_compressed, self.compressed_index_path)
 
             finished = datetime.now()
             result.update(
@@ -276,7 +214,6 @@ class DblpService:
                     "url": used_url,
                     "xml_size": os.path.getsize(self.xml_path),
                     "index_size": os.path.getsize(self.index_path),
-                    "compressed_index_size": os.path.getsize(self.compressed_index_path),
                 }
             )
             log(f"Finished DBLP update in {result['elapsed_seconds']}s")
@@ -295,7 +232,6 @@ class DblpService:
             for path in (
                 tmp_xml,
                 tmp_index,
-                tmp_compressed,
                 f"{tmp_index}-wal",
                 f"{tmp_index}-shm",
                 f"{tmp_index}-journal",
@@ -353,21 +289,12 @@ def make_handler(service: DblpService) -> type[BaseHTTPRequestHandler]:
                 if not self.authorized(params):
                     self.write_json({"error": "unauthorized"}, status=401)
                     return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/gzip")
+                self.send_header("Content-Disposition", 'attachment; filename="dblp.xml.gz.idx.sqlite3.gz"')
+                self.end_headers()
                 try:
-                    source, compressed_metadata = service.open_compressed_index()
-                    with source:
-                        self.send_response(200)
-                        self.send_header("Content-Type", "application/gzip")
-                        self.send_header("Content-Length", str(compressed_metadata["size"]))
-                        self.send_header("Content-Disposition", 'attachment; filename="dblp.xml.gz.idx.sqlite3.gz"')
-                        self.end_headers()
-                        while True:
-                            chunk = source.read(1024 * 1024)
-                            if not chunk:
-                                break
-                            self.wfile.write(chunk)
-                except FileNotFoundError as exc:
-                    self.write_json({"error": str(exc)}, status=503)
+                    service.stream_compressed_index(self.wfile)
                 except BrokenPipeError:
                     pass
                 return
@@ -479,11 +406,6 @@ def main() -> int:
 
     if os.path.exists(index_path):
         log(f"DBLP database exists: {index_path}")
-        try:
-            service.ensure_compressed_index()
-        except Exception as exc:
-            log(f"Failed to prepare compressed DBLP index; server will not start: {exc}")
-            return 1
     elif args.no_initial_update:
         log(f"DBLP database missing and initial update disabled: {index_path}")
     else:
