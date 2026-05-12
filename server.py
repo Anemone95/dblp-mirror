@@ -2,6 +2,7 @@
 
 import argparse
 from datetime import datetime, timedelta
+import glob
 import gzip
 import importlib.machinery
 import importlib.util
@@ -15,7 +16,7 @@ import time
 import traceback
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, List, Optional
+from typing import Any, BinaryIO, Dict, List, Optional, Tuple
 
 from config import CONFIG
 
@@ -38,6 +39,10 @@ def load_dblp_module() -> Any:
 dblp = load_dblp_module()
 
 
+def log(message: str) -> None:
+    print(f"[{datetime.now().isoformat(timespec='seconds')}] {message}", file=sys.stderr)
+
+
 class DblpService:
     def __init__(
         self,
@@ -49,11 +54,11 @@ class DblpService:
     ) -> None:
         self.xml_path = xml_path
         self.index_path = index_path
+        self.compressed_index_path = f"{index_path}.gz"
         self.token = token
         self.update_hour = update_hour
         self.lock = threading.RLock()
         self.last_update: Optional[Dict[str, Any]] = None
-        self.update_in_progress = False
 
     def query(self, title: str, limit: int) -> List[Dict[str, Any]]:
         with self.lock:
@@ -133,6 +138,7 @@ class DblpService:
             if not os.path.exists(self.index_path):
                 raise FileNotFoundError(self.index_path)
             stat_result = os.stat(self.index_path)
+            compressed_stat_result = os.stat(self.compressed_index_path) if os.path.exists(self.compressed_index_path) else None
             connection = sqlite3.connect(f"file:{urllib.parse.quote(os.path.abspath(self.index_path))}?mode=ro", uri=True)
             try:
                 metadata = dblp.read_index_metadata(connection)
@@ -144,20 +150,70 @@ class DblpService:
                 "index_path": self.index_path,
                 "index_size": stat_result.st_size,
                 "index_mtime_ns": stat_result.st_mtime_ns,
+                "compressed_index_path": self.compressed_index_path,
+                "compressed_index_size": compressed_stat_result.st_size if compressed_stat_result else None,
+                "compressed_index_mtime_ns": compressed_stat_result.st_mtime_ns if compressed_stat_result else None,
                 "schema_version": dblp.INDEX_SCHEMA_VERSION,
                 "metadata": metadata,
                 "record_count": record_count,
             }
 
-    def stream_compressed_index(self, output) -> None:
+    def open_compressed_index(self) -> Tuple[BinaryIO, Dict[str, Any]]:
         with self.lock:
-            source = open(self.index_path, "rb")
-        with source, gzip.GzipFile(fileobj=output, mode="wb", compresslevel=6) as compressed:
-            while True:
-                chunk = source.read(1024 * 1024)
-                if not chunk:
-                    break
-                compressed.write(chunk)
+            if not os.path.exists(self.compressed_index_path):
+                raise FileNotFoundError(self.compressed_index_path)
+            source = open(self.compressed_index_path, "rb")
+            try:
+                stat_result = os.fstat(source.fileno())
+                metadata = {
+                    "path": self.compressed_index_path,
+                    "size": stat_result.st_size,
+                    "mtime_ns": stat_result.st_mtime_ns,
+                }
+            except Exception:
+                source.close()
+                raise
+            return source, metadata
+
+    def compressed_index_is_current(self) -> bool:
+        return (
+            os.path.exists(self.compressed_index_path)
+            and os.path.getmtime(self.compressed_index_path) >= os.path.getmtime(self.index_path)
+        )
+
+    def create_compressed_index(self, source_index_path: str, destination_path: str) -> None:
+        compressed_dir = os.path.dirname(os.path.abspath(destination_path)) or "."
+        os.makedirs(compressed_dir, exist_ok=True)
+        fd, tmp_compressed = tempfile.mkstemp(
+            prefix=f".{os.path.basename(destination_path)}.",
+            suffix=".tmp",
+            dir=compressed_dir,
+        )
+        os.close(fd)
+
+        try:
+            with open(source_index_path, "rb") as source, gzip.open(tmp_compressed, "wb", compresslevel=6) as compressed:
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    compressed.write(chunk)
+            os.replace(tmp_compressed, destination_path)
+        finally:
+            try:
+                os.unlink(tmp_compressed)
+            except FileNotFoundError:
+                pass
+
+    def ensure_compressed_index(self) -> None:
+        if not os.path.exists(self.index_path):
+            raise FileNotFoundError(self.index_path)
+        if self.compressed_index_is_current():
+            log(f"Compressed DBLP index exists: {self.compressed_index_path}")
+            return
+        log(f"Creating compressed DBLP index: {self.compressed_index_path}")
+        self.create_compressed_index(self.index_path, self.compressed_index_path)
+        log(f"Compressed DBLP index ready: {self.compressed_index_path}")
 
     def update_once(self) -> Dict[str, Any]:
         started = datetime.now()
@@ -170,6 +226,7 @@ class DblpService:
         index_dir = os.path.dirname(os.path.abspath(self.index_path)) or "."
         os.makedirs(xml_dir, exist_ok=True)
         os.makedirs(index_dir, exist_ok=True)
+        self.cleanup_tmp_files(xml_dir, index_dir)
 
         xml_fd, tmp_xml = tempfile.mkstemp(
             prefix=f".{os.path.basename(self.xml_path)}.",
@@ -181,11 +238,19 @@ class DblpService:
             suffix=".tmp",
             dir=index_dir,
         )
+        compressed_fd, tmp_compressed = tempfile.mkstemp(
+            prefix=f".{os.path.basename(self.compressed_index_path)}.",
+            suffix=".tmp",
+            dir=index_dir,
+        )
         os.close(xml_fd)
         os.close(index_fd)
+        os.close(compressed_fd)
 
         try:
+            log(f"Starting DBLP update: xml={self.xml_path}, index={self.index_path}")
             used_url = dblp.download_with_fallback(dblp.DEFAULT_XML_URLS, tmp_xml)
+            log(f"Downloaded DBLP XML from {used_url}")
             connection = dblp.connect_index(tmp_index)
             try:
                 dblp.initialize_index(connection)
@@ -193,10 +258,14 @@ class DblpService:
             finally:
                 connection.close()
 
+            log(f"Creating compressed DBLP index: {self.compressed_index_path}")
+            self.create_compressed_index(tmp_index, tmp_compressed)
+
             with self.lock:
                 dblp.remove_sqlite_sidecars(self.index_path)
                 os.replace(tmp_xml, self.xml_path)
                 os.replace(tmp_index, self.index_path)
+                os.replace(tmp_compressed, self.compressed_index_path)
 
             finished = datetime.now()
             result.update(
@@ -207,8 +276,10 @@ class DblpService:
                     "url": used_url,
                     "xml_size": os.path.getsize(self.xml_path),
                     "index_size": os.path.getsize(self.index_path),
+                    "compressed_index_size": os.path.getsize(self.compressed_index_path),
                 }
             )
+            log(f"Finished DBLP update in {result['elapsed_seconds']}s")
             return result
         except Exception as exc:
             result.update(
@@ -218,11 +289,13 @@ class DblpService:
                     "finished_at": datetime.now().isoformat(timespec="seconds"),
                 }
             )
+            log(f"DBLP update failed: {exc}")
             return result
         finally:
             for path in (
                 tmp_xml,
                 tmp_index,
+                tmp_compressed,
                 f"{tmp_index}-wal",
                 f"{tmp_index}-shm",
                 f"{tmp_index}-journal",
@@ -232,25 +305,17 @@ class DblpService:
                 except FileNotFoundError:
                     pass
 
-    def start_background_update(self) -> bool:
-        with self.lock:
-            if self.update_in_progress:
-                return False
-            self.update_in_progress = True
-            self.last_update = {
-                "started_at": datetime.now().isoformat(timespec="seconds"),
-                "ok": False,
-                "status": "running",
-            }
-
-        def run() -> None:
-            result = self.update_once()
-            with self.lock:
-                self.last_update = result
-                self.update_in_progress = False
-
-        threading.Thread(target=run, daemon=True).start()
-        return True
+    @staticmethod
+    def cleanup_tmp_files(*directories: str) -> None:
+        for directory in sorted(set(directories)):
+            for path in glob.glob(os.path.join(directory, ".*.tmp*")):
+                if not os.path.isfile(path):
+                    continue
+                try:
+                    os.unlink(path)
+                    log(f"Removed stale temp file: {path}")
+                except FileNotFoundError:
+                    pass
 
     def run_update_loop(self) -> None:
         while True:
@@ -288,12 +353,21 @@ def make_handler(service: DblpService) -> type[BaseHTTPRequestHandler]:
                 if not self.authorized(params):
                     self.write_json({"error": "unauthorized"}, status=401)
                     return
-                self.send_response(200)
-                self.send_header("Content-Type", "application/gzip")
-                self.send_header("Content-Disposition", 'attachment; filename="dblp.xml.gz.idx.sqlite3.gz"')
-                self.end_headers()
                 try:
-                    service.stream_compressed_index(self.wfile)
+                    source, compressed_metadata = service.open_compressed_index()
+                    with source:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/gzip")
+                        self.send_header("Content-Length", str(compressed_metadata["size"]))
+                        self.send_header("Content-Disposition", 'attachment; filename="dblp.xml.gz.idx.sqlite3.gz"')
+                        self.end_headers()
+                        while True:
+                            chunk = source.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                except FileNotFoundError as exc:
+                    self.write_json({"error": str(exc)}, status=503)
                 except BrokenPipeError:
                     pass
                 return
@@ -381,7 +455,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-initial-update",
         action="store_true",
-        help="Do not start an immediate background update when the index is missing",
+        help="Start serving even when the index is missing instead of updating first",
     )
     return parser
 
@@ -390,23 +464,44 @@ def main() -> int:
     args = build_parser().parse_args()
     xml_path = os.path.join(args.db_path, XML_FILENAME)
     index_path = dblp.default_index_path(xml_path)
+    update_hour = max(0, min(args.update_hour, 23))
+
+    log("Starting DBLP search server")
+    log(f"Configured DBLP server bind: host={args.host}, port={args.port}")
+    log(f"Configured DBLP paths: xml={xml_path}, index={index_path}")
 
     service = DblpService(
         xml_path=xml_path,
         index_path=index_path,
         token=args.token,
-        update_hour=max(0, min(args.update_hour, 23)),
+        update_hour=update_hour,
     )
 
+    if os.path.exists(index_path):
+        log(f"DBLP database exists: {index_path}")
+        try:
+            service.ensure_compressed_index()
+        except Exception as exc:
+            log(f"Failed to prepare compressed DBLP index; server will not start: {exc}")
+            return 1
+    elif args.no_initial_update:
+        log(f"DBLP database missing and initial update disabled: {index_path}")
+    else:
+        log(f"DBLP database missing, running initial update before serving: {index_path}")
+        service.last_update = service.update_once()
+        if not service.last_update.get("ok"):
+            log("Initial DBLP update failed; server will not start")
+            return 1
+
     if not args.no_scheduler:
+        log(f"Starting daily update scheduler at hour {update_hour:02d}:00")
         updater = threading.Thread(target=service.run_update_loop, daemon=True)
         updater.start()
-
-    if not args.no_scheduler and not args.no_initial_update and not os.path.exists(index_path):
-        service.start_background_update()
+    else:
+        log("Daily update scheduler disabled")
 
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(service))
-    print(f"Serving DBLP search on http://{args.host}:{args.port}", file=sys.stderr)
+    log(f"Serving DBLP search on http://{args.host}:{args.port}")
     httpd.serve_forever()
     return 0
 
