@@ -131,13 +131,25 @@ def title_from_record_xml(record_xml: str) -> str:
     return decode_xml_text(XML_TAG_RE.sub("", title_match.group(1)))
 
 
-def iter_index_entries(xml_gz_path: str) -> Iterator[tuple[str, str, str]]:
+def iter_index_entries(
+    xml_gz_path: str,
+    position_callback: Optional[Callable[[int], None]] = None,
+) -> Iterator[tuple[str, str, str]]:
     current_tag: Optional[str] = None
     current_key: Optional[str] = None
     lines: List[str] = []
+    last_position = 0
 
     with gzip.open(xml_gz_path, "rt", encoding="ascii", errors="ignore") as source:
         for raw_line in source:
+            if position_callback is not None:
+                try:
+                    position = source.buffer.fileobj.tell()
+                    if position != last_position:
+                        last_position = position
+                        position_callback(position)
+                except Exception:
+                    pass
             remaining = raw_line
             while remaining:
                 if current_tag is None:
@@ -484,6 +496,18 @@ def rebuild_index_with_metadata_path(
     rows: List[tuple[str, str, str]] = []
     batch_size = 20000
     record_count = 0
+    compressed_bytes_read = 0
+
+    def update_position(position: int) -> None:
+        nonlocal compressed_bytes_read
+        compressed_bytes_read = max(compressed_bytes_read, min(position, stat_result.st_size))
+
+    def progress_record_summary() -> str:
+        if compressed_bytes_read <= 0 or stat_result.st_size <= 0:
+            return f"{record_count:,} records"
+        read_percent = min(compressed_bytes_read * 100 / stat_result.st_size, 100)
+        estimated_total = max(record_count, round(record_count * stat_result.st_size / compressed_bytes_read))
+        return f"{record_count:,} / ~{estimated_total:,} records ({read_percent:.1f}% XML read)"
 
     def flush_rows() -> None:
         if rows:
@@ -493,13 +517,13 @@ def rebuild_index_with_metadata_path(
             )
             rows.clear()
 
-    for normalized_title, citekey, record_xml in iter_index_entries(xml_gz_path):
+    for normalized_title, citekey, record_xml in iter_index_entries(xml_gz_path, position_callback=update_position):
         record_count += 1
         rows.append((normalized_title, citekey, record_xml))
         if len(rows) >= batch_size:
             flush_rows()
         if progress_callback and record_count % 100000 == 0:
-            progress_callback(f"Building SQLite index: inserted {record_count:,} records")
+            progress_callback(f"Building SQLite index: inserted {progress_record_summary()}")
 
     flush_rows()
     if progress_callback:
