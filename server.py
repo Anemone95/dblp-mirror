@@ -393,7 +393,6 @@ def main() -> int:
     index_path = dblp.default_index_path(xml_path)
     update_hour = max(0, min(args.update_hour, 23))
 
-    log("Starting DBLP search server")
     log(f"Configured DBLP server bind: host={args.host}, port={args.port}")
     log(f"Configured DBLP paths: xml={xml_path}, index={index_path}")
 
@@ -422,6 +421,7 @@ def main() -> int:
     else:
         log("Daily update scheduler disabled")
 
+    log("Starting DBLP search server")
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(service))
     log(f"Serving DBLP search on http://{args.host}:{args.port}")
     httpd.serve_forever()
