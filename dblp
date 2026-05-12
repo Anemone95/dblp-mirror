@@ -1,0 +1,683 @@
+#!/usr/bin/env python3
+
+import argparse
+from datetime import datetime
+import gzip
+import html.entities
+import os
+import re
+import sqlite3
+import sys
+import tempfile
+import textwrap
+import urllib.request
+import xml.etree.ElementTree as ET
+from typing import Dict, Iterable, Iterator, List, Optional
+
+
+PUBLICATION_TAGS = {
+    "article",
+    "inproceedings",
+    "proceedings",
+    "book",
+    "incollection",
+    "phdthesis",
+    "mastersthesis",
+    "www",
+}
+
+ENTRY_TYPE_MAP = {
+    "article": "article",
+    "inproceedings": "inproceedings",
+    "proceedings": "proceedings",
+    "book": "book",
+    "incollection": "incollection",
+    "phdthesis": "phdthesis",
+    "mastersthesis": "mastersthesis",
+    "www": "misc",
+}
+
+MULTI_VALUE_FIELDS = {
+    "author",
+    "editor",
+    "isbn",
+    "ee",
+    "url",
+}
+
+BIBTEX_FIELD_ORDER = [
+    "author",
+    "editor",
+    "title",
+    "booktitle",
+    "journal",
+    "series",
+    "volume",
+    "number",
+    "pages",
+    "publisher",
+    "school",
+    "year",
+    "isbn",
+    "url",
+    "doi",
+    "timestamp",
+    "biburl",
+    "bibsource",
+]
+
+XML_PREDEFINED_ENTITIES = {"amp", "lt", "gt", "quot", "apos"}
+NAMED_ENTITY_RE = re.compile(r"&([A-Za-z][A-Za-z0-9]+);")
+ACRONYM_RE = re.compile(r"\b[A-Z][A-Z0-9]*(?:/[A-Z0-9]+)*(?:'[0-9]{2})?\b")
+RECORD_START_RE = re.compile(
+    r"<(article|inproceedings|proceedings|book|incollection|phdthesis|mastersthesis|www)\b[^>]*\bkey=\"([^\"]+)\""
+)
+TITLE_RE = re.compile(r"<title>(.*?)</title>")
+DEFAULT_XML_URLS = [
+    "https://dblp.org/xml/dblp.xml.gz",
+    "https://dblp.uni-trier.de/xml/dblp.xml.gz",
+]
+INDEX_SCHEMA_VERSION = 2
+
+
+def normalize_title(title: str) -> str:
+    normalized = re.sub(r"\s+", " ", title).strip().casefold()
+    return normalized.rstrip(".").strip()
+
+
+def escape_bibtex(value: str) -> str:
+    return value.replace("\\", "\\\\")
+
+
+def element_text(elem: ET.Element) -> str:
+    return re.sub(r"\s+", " ", "".join(elem.itertext())).strip()
+
+
+def sanitize_xml_entities(text: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        entity = match.group(1)
+        if entity in XML_PREDEFINED_ENTITIES:
+            return match.group(0)
+        codepoint = html.entities.name2codepoint.get(entity)
+        if codepoint is None:
+            return match.group(0)
+        return f"&#{codepoint};"
+
+    return NAMED_ENTITY_RE.sub(replace, text)
+
+
+def decode_xml_text(text: str) -> str:
+    return re.sub(r"\s+", " ", html.unescape(sanitize_xml_entities(text))).strip()
+
+
+def iter_publications(xml_gz_path: str) -> Iterator[ET.Element]:
+    parser = ET.XMLPullParser(events=["end"])
+    with gzip.open(xml_gz_path, "rt", encoding="ascii") as source:
+        for line in source:
+            parser.feed(sanitize_xml_entities(line))
+            for _, elem in parser.read_events():
+                if elem.tag in PUBLICATION_TAGS:
+                    yield elem
+                    elem.clear()
+
+
+def iter_title_keys(xml_gz_path: str) -> Iterator[tuple[str, str]]:
+    current_key: Optional[str] = None
+    with gzip.open(xml_gz_path, "rt", encoding="ascii", errors="ignore") as source:
+        for raw_line in source:
+            line = raw_line.strip()
+            if current_key is None:
+                start_match = RECORD_START_RE.search(line)
+                if start_match:
+                    current_key = start_match.group(2)
+                continue
+
+            title_match = TITLE_RE.search(line)
+            if title_match:
+                title = decode_xml_text(title_match.group(1))
+                if title:
+                    yield normalize_title(title), current_key
+                current_key = None
+
+
+def extract_record(elem: ET.Element) -> Dict[str, object]:
+    record: Dict[str, object] = {
+        "entry_type": ENTRY_TYPE_MAP[elem.tag],
+        "citekey": elem.attrib.get("key", "dblp/unknown"),
+    }
+    if "mdate" in elem.attrib:
+        record["mdate"] = elem.attrib["mdate"]
+
+    for child in elem:
+        tag = child.tag
+        if tag not in MULTI_VALUE_FIELDS and tag not in {
+            "title",
+            "booktitle",
+            "journal",
+            "series",
+            "volume",
+            "number",
+            "pages",
+            "publisher",
+            "school",
+            "year",
+            "crossref",
+            "note",
+        }:
+            continue
+
+        text = element_text(child)
+        if not text:
+            continue
+
+        if tag in MULTI_VALUE_FIELDS:
+            record.setdefault(tag, []).append(text)
+        else:
+            record[tag] = text
+
+    ee_values = record.get("ee", [])
+    if isinstance(ee_values, list):
+        doi_values = []
+        url_values = []
+        for value in ee_values:
+            if value.startswith("https://doi.org/") or value.startswith("http://doi.org/"):
+                doi_values.append(re.sub(r"^https?://doi\.org/", "", value))
+            else:
+                url_values.append(value)
+        if doi_values:
+            record["doi"] = doi_values[0]
+        if url_values and "url" not in record:
+            record["url"] = url_values[0]
+
+    url_values = record.get("url", [])
+    if isinstance(url_values, list):
+        if url_values:
+            record["url"] = url_values[0]
+        else:
+            record.pop("url", None)
+
+    return record
+
+
+def strip_title_period(value: str) -> str:
+    return value[:-1] if value.endswith(".") else value
+
+
+def format_pages(value: str) -> str:
+    return re.sub(r"(?<=\d)-(?=\d)", "--", value)
+
+
+def protect_acronyms(value: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        return f"{{{match.group(0)}}}"
+
+    return ACRONYM_RE.sub(replace, value)
+
+
+def format_timestamp(mdate: object) -> Optional[str]:
+    if not isinstance(mdate, str):
+        return None
+    try:
+        parsed = datetime.strptime(mdate, "%Y-%m-%d")
+    except ValueError:
+        return None
+    return parsed.strftime("%a, %d %b %Y 00:00:00 +0000")
+
+
+def enrich_record_with_crossref(
+    record: Dict[str, object],
+    crossref_record: Optional[Dict[str, object]],
+) -> Dict[str, object]:
+    if crossref_record is None:
+        return record
+
+    enriched = dict(record)
+    for field in ("editor", "publisher", "series", "volume", "number"):
+        if field not in enriched and field in crossref_record:
+            enriched[field] = crossref_record[field]
+
+    if record.get("entry_type") == "inproceedings" and "title" in crossref_record:
+        enriched["booktitle"] = crossref_record["title"]
+
+    return enriched
+
+
+def render_bibtex_value(field: str, value: object) -> str | List[str]:
+    if isinstance(value, list):
+        return [escape_bibtex(str(item)) for item in value]
+
+    rendered = str(value)
+    if field == "title":
+        rendered = strip_title_period(rendered)
+    elif field == "pages":
+        rendered = format_pages(rendered)
+
+    if field in {"booktitle", "publisher", "series"}:
+        rendered = protect_acronyms(rendered)
+
+    return escape_bibtex(rendered)
+
+
+def format_bibtex_field(field: str, value: object) -> List[str]:
+    prefix = f"  {field:<13}= "
+    continuation = " " * (len(prefix) + 1)
+
+    if isinstance(value, list) and field in {"author", "editor"}:
+        if not value:
+            return []
+
+        rendered_values = [str(item) for item in render_bibtex_value(field, value)]
+        if len(rendered_values) == 1:
+            return [f"{prefix}{{{rendered_values[0]}}},"]
+
+        lines = [f"{prefix}{{{rendered_values[0]} and"]
+        for item in rendered_values[1:-1]:
+            lines.append(f"{continuation}{item} and")
+        lines.append(f"{continuation}{rendered_values[-1]}}},")
+        return lines
+
+    rendered = str(render_bibtex_value(field, value))
+    wrapped = textwrap.wrap(
+        rendered,
+        width=80 - len(continuation),
+        break_long_words=False,
+        break_on_hyphens=False,
+    ) or [""]
+
+    lines = [f"{prefix}{{{wrapped[0]}"]
+    lines.extend(f"{continuation}{line}" for line in wrapped[1:])
+    lines[-1] = f"{lines[-1]}}},"
+    return lines
+
+
+def format_bibtex(record: Dict[str, object]) -> str:
+    formatted_record = dict(record)
+    citekey = str(formatted_record["citekey"])
+    doi = formatted_record.get("doi")
+    if doi:
+        formatted_record["url"] = f"https://doi.org/{doi}"
+
+    timestamp = format_timestamp(formatted_record.get("mdate"))
+    if timestamp:
+        formatted_record["timestamp"] = timestamp
+    formatted_record["biburl"] = f"https://dblp.org/rec/{citekey}.bib"
+    formatted_record["bibsource"] = "dblp computer science bibliography, https://dblp.org"
+
+    lines = [f"@{formatted_record['entry_type']}{{DBLP:{citekey},"]
+
+    for field in BIBTEX_FIELD_ORDER:
+        value = formatted_record.get(field)
+        if not value:
+            continue
+
+        lines.extend(format_bibtex_field(field, value))
+
+    if lines[-1].endswith(","):
+        lines[-1] = lines[-1][:-1]
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def default_index_path(xml_gz_path: str) -> str:
+    return f"{xml_gz_path}.idx.sqlite3"
+
+
+def connect_index(index_path: str) -> sqlite3.Connection:
+    connection = sqlite3.connect(index_path)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=NORMAL")
+    return connection
+
+
+def initialize_index(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS records (
+            normalized_title TEXT NOT NULL,
+            title TEXT NOT NULL,
+            citekey TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_records_normalized_title
+        ON records(normalized_title);
+
+        """
+    )
+
+
+def read_index_metadata(connection: sqlite3.Connection) -> Dict[str, str]:
+    rows = connection.execute("SELECT key, value FROM metadata").fetchall()
+    return {key: value for key, value in rows}
+
+
+def write_index_metadata(
+    connection: sqlite3.Connection,
+    *,
+    xml_gz_path: str,
+    stat_result: os.stat_result,
+) -> None:
+    metadata = {
+        "schema_version": str(INDEX_SCHEMA_VERSION),
+        "source_path": os.path.abspath(xml_gz_path),
+        "source_size": str(stat_result.st_size),
+        "source_mtime_ns": str(stat_result.st_mtime_ns),
+    }
+    connection.executemany(
+        "REPLACE INTO metadata(key, value) VALUES(?, ?)",
+        metadata.items(),
+    )
+
+
+def index_is_fresh(
+    metadata: Dict[str, str],
+    *,
+    xml_gz_path: str,
+    stat_result: os.stat_result,
+) -> bool:
+    expected = {
+        "schema_version": str(INDEX_SCHEMA_VERSION),
+        "source_path": os.path.abspath(xml_gz_path),
+        "source_size": str(stat_result.st_size),
+        "source_mtime_ns": str(stat_result.st_mtime_ns),
+    }
+    return all(metadata.get(key) == value for key, value in expected.items())
+
+
+def rebuild_index(connection: sqlite3.Connection, xml_gz_path: str) -> None:
+    stat_result = os.stat(xml_gz_path)
+    connection.execute("DROP TABLE IF EXISTS records")
+    connection.execute(
+        """
+        CREATE TABLE records (
+            normalized_title TEXT NOT NULL,
+            title TEXT NOT NULL,
+            citekey TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_records_normalized_title
+        ON records(normalized_title)
+        """
+    )
+    rows: List[tuple[str, str, str]] = []
+    batch_size = 10000
+    for normalized_title, citekey in iter_title_keys(xml_gz_path):
+        rows.append((normalized_title, normalized_title, citekey))
+        if len(rows) >= batch_size:
+            connection.executemany(
+                "INSERT INTO records(normalized_title, title, citekey) VALUES(?, ?, ?)",
+                rows,
+            )
+            rows.clear()
+
+    if rows:
+        connection.executemany(
+            "INSERT INTO records(normalized_title, title, citekey) VALUES(?, ?, ?)",
+            rows,
+        )
+
+    write_index_metadata(connection, xml_gz_path=xml_gz_path, stat_result=stat_result)
+    connection.commit()
+
+
+def ensure_index(xml_gz_path: str, index_path: str) -> sqlite3.Connection:
+    connection = connect_index(index_path)
+    initialize_index(connection)
+    stat_result = os.stat(xml_gz_path)
+    metadata = read_index_metadata(connection)
+    if not index_is_fresh(metadata, xml_gz_path=xml_gz_path, stat_result=stat_result):
+        rebuild_index(connection, xml_gz_path)
+    return connection
+
+
+def index_exists_and_is_fresh(xml_gz_path: str, index_path: str) -> bool:
+    if not os.path.exists(index_path):
+        return False
+
+    connection = connect_index(index_path)
+    try:
+        initialize_index(connection)
+        stat_result = os.stat(xml_gz_path)
+        metadata = read_index_metadata(connection)
+        return index_is_fresh(metadata, xml_gz_path=xml_gz_path, stat_result=stat_result)
+    finally:
+        connection.close()
+
+
+def find_local_records(xml_gz_path: str, citekeys: Iterable[str]) -> Dict[str, Dict[str, object]]:
+    remaining = set(citekeys)
+    records: Dict[str, Dict[str, object]] = {}
+    if not remaining:
+        return records
+
+    for elem in iter_publications(xml_gz_path):
+        citekey = elem.attrib.get("key")
+        if citekey not in remaining:
+            continue
+
+        records[citekey] = extract_record(elem)
+        remaining.remove(citekey)
+        if not remaining:
+            break
+
+    return records
+
+
+def local_bibtex(connection: sqlite3.Connection, xml_gz_path: str, citekeys: List[str]) -> Dict[str, str]:
+    bibtex_by_key: Dict[str, str] = {}
+    records = find_local_records(xml_gz_path, citekeys)
+    crossref_keys = [
+        str(record["crossref"])
+        for record in records.values()
+        if isinstance(record.get("crossref"), str)
+    ]
+    crossref_records = find_local_records(xml_gz_path, crossref_keys)
+
+    for citekey in citekeys:
+        record = records.get(citekey)
+        if record is None:
+            continue
+
+        crossref_key = record.get("crossref")
+        crossref_record = (
+            crossref_records.get(crossref_key)
+            if isinstance(crossref_key, str)
+            else None
+        )
+        enriched_record = enrich_record_with_crossref(record, crossref_record)
+        bibtex_by_key[citekey] = format_bibtex(enriched_record)
+
+    return bibtex_by_key
+
+
+def find_match_keys(xml_gz_path: str, title_query: str, index_path: Optional[str] = None) -> List[str]:
+    target = normalize_title(title_query)
+    if not target:
+        return []
+
+    resolved_index_path = index_path or default_index_path(xml_gz_path)
+    if index_exists_and_is_fresh(xml_gz_path, resolved_index_path):
+        connection = connect_index(resolved_index_path)
+        try:
+            exact_rows = connection.execute(
+                "SELECT citekey FROM records WHERE normalized_title = ? LIMIT 10",
+                (target,),
+            ).fetchall()
+            if exact_rows:
+                return [row[0] for row in exact_rows]
+
+            fallback_rows = connection.execute(
+                "SELECT citekey FROM records WHERE normalized_title LIKE ? LIMIT 10",
+                (f"%{target}%",),
+            ).fetchall()
+            return [row[0] for row in fallback_rows]
+        finally:
+            connection.close()
+
+    fallback_matches: List[str] = []
+    for normalized_title, citekey in iter_title_keys(xml_gz_path):
+        if normalized_title == target:
+            return [citekey]
+        if target in normalized_title and len(fallback_matches) < 10:
+            fallback_matches.append(citekey)
+    return fallback_matches
+
+
+def download_file(url: str, destination: str) -> None:
+    destination_dir = os.path.dirname(os.path.abspath(destination)) or "."
+    os.makedirs(destination_dir, exist_ok=True)
+
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=".dblp-download-",
+        suffix=".tmp",
+        dir=destination_dir,
+    )
+    os.close(fd)
+
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "dblp-cli/1.0"})
+        with urllib.request.urlopen(request) as response, open(tmp_path, "wb") as out:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+        os.replace(tmp_path, destination)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def download_with_fallback(urls: List[str], destination: str) -> str:
+    errors = []
+    for url in urls:
+        try:
+            download_file(url, destination)
+            return url
+        except Exception as exc:
+            errors.append(f"{url}: {exc}")
+
+    raise RuntimeError("; ".join(errors))
+
+
+def cmd_query(args: argparse.Namespace) -> int:
+    xml_gz_path = args.file
+    if not os.path.exists(xml_gz_path):
+        print(f"XML file not found: {xml_gz_path}", file=sys.stderr)
+        return 2
+
+    match_keys = find_match_keys(xml_gz_path, args.title, args.index)
+    if not match_keys:
+        print("No matching title found.", file=sys.stderr)
+        return 1
+
+    connection = connect_index(args.index)
+    try:
+        initialize_index(connection)
+        bibtex_by_key = local_bibtex(connection, xml_gz_path, match_keys)
+        missing_keys = [citekey for citekey in match_keys if citekey not in bibtex_by_key]
+        if missing_keys:
+            print(
+                f"Matched title, but record not found in local XML: {', '.join(missing_keys)}",
+                file=sys.stderr,
+            )
+            return 1
+
+        for index, citekey in enumerate(match_keys):
+            if index:
+                print()
+            print(bibtex_by_key[citekey])
+    except Exception as exc:
+        print(f"Failed to read BibTeX from local mirror: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        connection.close()
+
+    return 0
+
+
+def cmd_update(args: argparse.Namespace) -> int:
+    try:
+        used_url = download_with_fallback(DEFAULT_XML_URLS, args.output)
+    except Exception as exc:
+        print(f"Failed to download update file: {exc}", file=sys.stderr)
+        return 1
+
+    size = os.path.getsize(args.output)
+    print(f"Updated {args.output} from {used_url} ({size} bytes)")
+    return 0
+
+
+def cmd_index(args: argparse.Namespace) -> int:
+    try:
+        connection = connect_index(args.index)
+        try:
+            initialize_index(connection)
+            rebuild_index(connection, args.file)
+        finally:
+            connection.close()
+    except Exception as exc:
+        print(f"Failed to build index: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"Built index {args.index} for {args.file}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    default_xml = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dblp.xml.gz")
+    parser = argparse.ArgumentParser(prog="dblp")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    query_parser = subparsers.add_parser("query", help="Query BibTeX by title from dblp.xml.gz")
+    query_parser.add_argument("title", help="Publication title to search for")
+    query_parser.add_argument(
+        "--file",
+        default=default_xml,
+        help="Path to dblp.xml.gz (default: %(default)s)",
+    )
+    query_parser.add_argument(
+        "--index",
+        default=default_index_path(default_xml),
+        help="Path to the local SQLite query index (default: %(default)s)",
+    )
+    query_parser.set_defaults(func=cmd_query)
+
+    index_parser = subparsers.add_parser("index", help="Build a local SQLite title-to-key index")
+    index_parser.add_argument(
+        "--file",
+        default=default_xml,
+        help="Path to dblp.xml.gz (default: %(default)s)",
+    )
+    index_parser.add_argument(
+        "--index",
+        default=default_index_path(default_xml),
+        help="Path to the local SQLite query index (default: %(default)s)",
+    )
+    index_parser.set_defaults(func=cmd_index)
+
+    update_parser = subparsers.add_parser("update", help="Download the latest dblp.xml.gz")
+    update_parser.set_defaults(output=default_xml)
+    update_parser.set_defaults(func=cmd_update)
+
+    return parser
+
+
+def main(argv: Optional[Iterable[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(list(argv) if argv is not None else None)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
