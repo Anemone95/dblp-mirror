@@ -363,8 +363,8 @@ def make_handler(service: DblpService) -> type[BaseHTTPRequestHandler]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="server.py")
-    parser.add_argument("--host", default=CONFIG.DBLP_HOST)
-    parser.add_argument("--port", type=int, default=CONFIG.DBLP_PORT)
+    parser.add_argument("--host", default=CONFIG.SERVER_HOST)
+    parser.add_argument("--port", type=int, default=CONFIG.SERVER_PORT)
     parser.add_argument("--db-path", default=CONFIG.DB_PATH)
     parser.add_argument("--token", default=CONFIG.DBLP_TOKEN)
     parser.add_argument(

@@ -1,5 +1,6 @@
 import importlib.util
 import os
+import urllib.parse
 from types import SimpleNamespace
 
 import settings
@@ -20,8 +21,6 @@ else:
 
 CONFIG_KEYS = (
     "DBLP_SERVER",
-    "DBLP_HOST",
-    "DBLP_PORT",
     "DBLP_TOKEN",
     "DBLP_UPDATE_HOUR",
     "DB_PATH",
@@ -38,9 +37,17 @@ def load_config():
     values = {name: _value(name) for name in CONFIG_KEYS}
     if values["DB_PATH"] is None:
         values["DB_PATH"] = ROOT_DIR
-    values["DBLP_PORT"] = int(values["DBLP_PORT"])
+    parsed_server = urllib.parse.urlparse(values["DBLP_SERVER"])
+    values["SERVER_HOST"] = parsed_server.hostname or "127.0.0.1"
+    values["SERVER_PORT"] = parsed_server.port or _default_port(parsed_server.scheme)
     values["DBLP_UPDATE_HOUR"] = int(values["DBLP_UPDATE_HOUR"])
     return SimpleNamespace(**values)
+
+
+def _default_port(scheme):
+    if scheme == "https":
+        return 443
+    return 80
 
 
 CONFIG = load_config()

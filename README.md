@@ -16,8 +16,6 @@ Default values live in `settings.py`:
 
 ```python
 DBLP_SERVER = "http://127.0.0.1:8765"
-DBLP_HOST = "0.0.0.0"
-DBLP_PORT = 8765
 DBLP_TOKEN = ""
 DBLP_UPDATE_HOUR = 3
 DB_PATH = None
@@ -27,9 +25,7 @@ To customize a machine, copy `settings_local.py.template` to `settings_local.py`
 
 Settings:
 
-- `DBLP_SERVER`: Base URL of your private DBLP search server.
-- `DBLP_HOST`: Host interface for `make server` / `server.py` to bind.
-- `DBLP_PORT`: Port for `make server` / `server.py` to bind.
+- `DBLP_SERVER`: Base URL of your private DBLP search server. `server.py` derives its default bind host and port from this URL.
 - `DBLP_TOKEN`: Shared bearer token for protected server endpoints.
 - `DBLP_UPDATE_HOUR`: Local server hour for the daily DBLP update.
 - `DB_PATH`: Directory containing `dblp.xml.gz` and `dblp.xml.gz.idx.sqlite3`. If set to `None`, this is the repository root.
@@ -48,6 +44,7 @@ make server
 ```
 
 `make server` runs `server.py` through `run_server.py`, a small foreground supervisor that restarts the server if it exits.
+Use `python3 run_server.py --host <host> --port <port>` when the process must bind somewhere different from `DBLP_SERVER`.
 If the SQLite index is missing at startup, the server starts one background update immediately. Until that update finishes, `/health` reports `ok: false` and `/query` returns HTTP 503 with the missing index path.
 
 Server endpoints:
