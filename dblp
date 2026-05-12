@@ -17,7 +17,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, Iterable, Iterator, List, Optional
 
-import settings
+from config import CONFIG
 
 
 PUBLICATION_TAGS = {
@@ -707,7 +707,7 @@ def configured_index_path(file_path: Optional[str] = None, index_path: Optional[
     if file_path:
         return default_index_path(file_path)
 
-    db_path = os.environ.get("DB_PATH", settings.DB_PATH)
+    db_path = CONFIG.DB_PATH
     return default_index_path(os.path.join(db_path, XML_FILENAME))
 
 
@@ -725,10 +725,10 @@ def query_with_fallback(
         except Exception as exc:
             print(f"Local DBLP index failed, falling back to server: {exc}", file=sys.stderr)
 
-    server = os.environ.get("DBLP_SERVER", settings.DBLP_SERVER).strip()
-    token = os.environ.get("DBLP_TOKEN", settings.DBLP_TOKEN)
+    server = CONFIG.DBLP_SERVER.strip()
+    token = CONFIG.DBLP_TOKEN
     if not server:
-        return alfred_items("DBLP server is not configured", "Set DBLP_SERVER in settings.py")
+        return alfred_items("DBLP server is not configured", "Set DBLP_SERVER in settings_local.py")
 
     try:
         payload = query_server(server, token, query, limit)
@@ -742,7 +742,7 @@ def query_with_fallback(
             pass
         return alfred_items(f"DBLP server error: HTTP {exc.code}", detail)
     except Exception as exc:
-        return alfred_items(f"DBLP server error: {exc}", "Check settings.py")
+        return alfred_items(f"DBLP server error: {exc}", "Check settings_local.py")
 
     if "error" in payload and "items" not in payload:
         return alfred_items(f"DBLP server error: {payload['error']}", "Try again later")
@@ -750,14 +750,14 @@ def query_with_fallback(
 
 
 def pull_index_from_server() -> int:
-    server = os.environ.get("DBLP_SERVER", settings.DBLP_SERVER).strip()
-    token = os.environ.get("DBLP_TOKEN", settings.DBLP_TOKEN)
+    server = CONFIG.DBLP_SERVER.strip()
+    token = CONFIG.DBLP_TOKEN
     index_path = configured_index_path()
     if not server:
-        print("DBLP_SERVER is not configured in settings.py", file=sys.stderr)
+        print("DBLP_SERVER is not configured in settings_local.py", file=sys.stderr)
         return 2
     if not index_path:
-        print("DB_PATH is not configured in settings.py", file=sys.stderr)
+        print("DB_PATH is not configured in settings_local.py", file=sys.stderr)
         return 2
 
     index_dir = os.path.dirname(os.path.abspath(index_path)) or "."

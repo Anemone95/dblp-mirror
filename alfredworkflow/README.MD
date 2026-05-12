@@ -1,12 +1,12 @@
 # DBLP search Alfred workflow #
 
 ## Usage
-Configure `settings.py` in the repository root:
+Default values are bundled from `settings.py` in the repository root:
 
 - `DBLP_SERVER`: base URL of your private DBLP search server, for example `https://dblp.example.com`
 - `DBLP_TOKEN`: bearer token configured on the server
 
-You can also override these values in Alfred workflow configuration.
+Override these values in Alfred workflow configuration.
 
 Open up Alfred, type `dblp` and then the query terms separated by `SPACE`.
 

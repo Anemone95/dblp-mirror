@@ -17,7 +17,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 
-import settings
+from config import CONFIG
 
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -362,16 +362,15 @@ def make_handler(service: DblpService) -> type[BaseHTTPRequestHandler]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    db_path = os.environ.get("DB_PATH", settings.DB_PATH)
     parser = argparse.ArgumentParser(prog="server.py")
-    parser.add_argument("--host", default=os.environ.get("DBLP_HOST", settings.DBLP_HOST))
-    parser.add_argument("--port", type=int, default=int(os.environ.get("DBLP_PORT", str(settings.DBLP_PORT))))
-    parser.add_argument("--db-path", default=db_path)
-    parser.add_argument("--token", default=os.environ.get("DBLP_TOKEN", settings.DBLP_TOKEN))
+    parser.add_argument("--host", default=CONFIG.DBLP_HOST)
+    parser.add_argument("--port", type=int, default=CONFIG.DBLP_PORT)
+    parser.add_argument("--db-path", default=CONFIG.DB_PATH)
+    parser.add_argument("--token", default=CONFIG.DBLP_TOKEN)
     parser.add_argument(
         "--update-hour",
         type=int,
-        default=int(os.environ.get("DBLP_UPDATE_HOUR", str(settings.DBLP_UPDATE_HOUR))),
+        default=CONFIG.DBLP_UPDATE_HOUR,
         help="Local hour of day for the daily DBLP update, 0-23",
     )
     parser.add_argument(

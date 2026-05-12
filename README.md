@@ -12,27 +12,27 @@ The intended setup is:
 
 ## Configuration
 
-Edit `settings.py`:
+Default values live in `settings.py`:
 
 ```python
-DBLP_SERVER = "https://dblp.example.com"
+DBLP_SERVER = "http://127.0.0.1:8765"
 DBLP_HOST = "0.0.0.0"
 DBLP_PORT = 8765
-DBLP_TOKEN = "change-me"
+DBLP_TOKEN = ""
 DBLP_UPDATE_HOUR = 3
-DB_PATH = ROOT_DIR
+DB_PATH = None
 ```
+
+To customize a machine, copy `settings_local.py.template` to `settings_local.py` and edit the copied file. `settings_local.py` is ignored by Git.
 
 Settings:
 
 - `DBLP_SERVER`: Base URL of your private DBLP search server.
 - `DBLP_HOST`: Host interface for `make server` / `server.py` to bind.
-- `DBLP_PORT`: Port for `make server` / `server.py` to bind. If omitted, it is derived from `DBLP_SERVER`.
+- `DBLP_PORT`: Port for `make server` / `server.py` to bind.
 - `DBLP_TOKEN`: Shared bearer token for protected server endpoints.
 - `DBLP_UPDATE_HOUR`: Local server hour for the daily DBLP update.
-- `DB_PATH`: Directory containing `dblp.xml.gz` and `dblp.xml.gz.idx.sqlite3`. By default, this is the directory containing `settings.py`.
-
-For machine-specific values, create an ignored `settings_local.py` with the same variables, or set environment variables such as `DBLP_SERVER`, `DBLP_PORT`, and `DBLP_TOKEN`.
+- `DB_PATH`: Directory containing `dblp.xml.gz` and `dblp.xml.gz.idx.sqlite3`. If set to `None`, this is the repository root.
 
 The derived database files are:
 
@@ -97,9 +97,9 @@ The source workflow is in `alfredworkflow/workflow5`. The packaged workflow is:
 alfredworkflow/dblp-search.alfredworkflow
 ```
 
-During development, `alfredworkflow/workflow5/settings.py` is a symlink to the repository root `settings.py`. The packaged workflow includes the current settings file content.
+During development, `alfredworkflow/workflow5/settings.py` is a symlink to the repository root `settings.py`. The packaged workflow includes the default settings file content.
 
-Alfred workflow variables can override the bundled settings:
+Alfred workflow variables can override the bundled defaults:
 
 - `DBLP_SERVER`
 - `DBLP_TOKEN`
