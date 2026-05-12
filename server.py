@@ -206,9 +206,10 @@ class DblpService:
         os.close(index_fd)
 
         try:
-            log(f"Starting DBLP update: xml={self.xml_path}, index={self.index_path}")
+            log(f"Starting DBLP update: index={self.index_path}")
             used_url = dblp.download_with_fallback(dblp.DEFAULT_XML_URLS, tmp_xml, progress_callback=log)
             log(f"Downloaded DBLP XML from {used_url}")
+            xml_size = os.path.getsize(tmp_xml)
             connection = dblp.connect_index(tmp_index)
             try:
                 dblp.initialize_index(connection)
@@ -218,8 +219,12 @@ class DblpService:
 
             with self.lock:
                 dblp.remove_sqlite_sidecars(self.index_path)
-                os.replace(tmp_xml, self.xml_path)
                 os.replace(tmp_index, self.index_path)
+                try:
+                    os.unlink(self.xml_path)
+                    log(f"Removed DBLP XML mirror after update: {self.xml_path}")
+                except FileNotFoundError:
+                    pass
 
             finished = datetime.now()
             result.update(
@@ -228,7 +233,7 @@ class DblpService:
                     "finished_at": finished.isoformat(timespec="seconds"),
                     "elapsed_seconds": round((finished - started).total_seconds(), 3),
                     "url": used_url,
-                    "xml_size": os.path.getsize(self.xml_path),
+                    "xml_size": xml_size,
                     "index_size": os.path.getsize(self.index_path),
                 }
             )

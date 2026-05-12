@@ -28,11 +28,10 @@ Settings:
 - `DBLP_SERVER`: Base URL of your private DBLP search server. `server.py` derives its default bind host and port from this URL.
 - `DBLP_TOKEN`: Shared bearer token for protected server endpoints.
 - `DBLP_UPDATE_HOUR`: Local server hour for the daily DBLP update.
-- `DB_PATH`: Directory containing `dblp.xml.gz` and `dblp.xml.gz.idx.sqlite3`. If set to `None`, this is the repository root.
+- `DB_PATH`: Directory containing `dblp.xml.gz.idx.sqlite3`. If set to `None`, this is the repository root.
 
-The derived database files are:
+The derived database file is:
 
-- XML mirror: `<DB_PATH>/dblp.xml.gz`
 - SQLite index: `<DB_PATH>/dblp.xml.gz.idx.sqlite3`
 
 ## Server
@@ -45,7 +44,7 @@ make server
 
 `make server` runs `server.py` through `run_server.py`, a small foreground supervisor that restarts the server if it exits.
 Use `python3 run_server.py --host <host> --port <port>` when the process must bind somewhere different from `DBLP_SERVER`.
-At startup, the server logs its bind address and database paths, checks for the SQLite index, and runs one update before serving if the index is missing. Each update removes stale `.*.tmp*` files from the XML and index directories before downloading or rebuilding.
+At startup, the server logs its bind address and database paths, checks for the SQLite index, and runs one update before serving if the index is missing. Each update removes stale `.*.tmp*` files before downloading or rebuilding.
 
 Server endpoints:
 
@@ -55,7 +54,7 @@ Server endpoints:
 - `GET /index/metadata`: metadata for the downloadable SQLite index.
 - `GET /index.gz`: stream the completed SQLite index as gzip.
 
-The scheduled update downloads DBLP XML to a temporary file, builds a temporary SQLite index, and atomically replaces the live XML/index only after the full build succeeds.
+The scheduled update downloads DBLP XML to a temporary file, builds a temporary SQLite index, and atomically replaces the live SQLite index only after the full build succeeds. The downloaded XML mirror is not retained.
 
 ## Client
 
