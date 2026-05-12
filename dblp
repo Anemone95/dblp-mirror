@@ -2,6 +2,7 @@
 
 import argparse
 from datetime import datetime
+import errno
 import gzip
 import html.entities
 import json
@@ -629,6 +630,15 @@ def alfred_items(message: str, subtitle: str = "", *, valid: bool = False) -> Di
     }
 
 
+def is_connection_refused(exc: BaseException) -> bool:
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    return (
+        isinstance(reason, ConnectionRefusedError)
+        or getattr(reason, "errno", None) == errno.ECONNREFUSED
+        or "Connection refused" in str(exc)
+    )
+
+
 def request_url(
     server: str,
     path: str,
@@ -741,8 +751,18 @@ def query_with_fallback(
         except Exception:
             pass
         return alfred_items(f"DBLP server error: HTTP {exc.code}", detail)
+    except urllib.error.URLError as exc:
+        if is_connection_refused(exc):
+            return alfred_items(
+                "DBLP server is not reachable",
+                "Server is not listening yet; start it, wait for initial update to finish, or check DBLP_SERVER host/port.",
+            )
+        return alfred_items(
+            f"DBLP server error: {exc}",
+            "Check that DBLP_SERVER is reachable and the server is running.",
+        )
     except Exception as exc:
-        return alfred_items(f"DBLP server error: {exc}", "Check settings_local.py")
+        return alfred_items(f"DBLP server error: {exc}", "Check server logs and settings_local.py")
 
     if "error" in payload and "items" not in payload:
         return alfred_items(f"DBLP server error: {payload['error']}", "Try again later")
