@@ -1,0 +1,9 @@
+import os
+
+
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+DBLP_SERVER = "http://127.0.0.1:8765"
+DBLP_TOKEN = ""
+DBLP_UPDATE_HOUR = 3
+DB_PATH = ROOT_DIR

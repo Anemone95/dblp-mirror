@@ -3,3 +3,4 @@ dblp.xml.gz.idx.sqlite3
 dblp.xml.gz.idx.sqlite3-*
 __pycache__/
 *.py[cod]
+alfredworkflow/dblp-search.alfredworkflow
