@@ -7,7 +7,7 @@ OUTPUT_FILE=alfredworkflow/$(WORKFLOW_NAME).alfredworkflow
 all: workflow
 
 server:
-	python3 run_server.py --host 0.0.0.0 --port 8765
+	python3 run_server.py
 
 update:
 	./dblp pull

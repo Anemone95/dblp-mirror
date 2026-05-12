@@ -16,6 +16,8 @@ Edit `settings.py`:
 
 ```python
 DBLP_SERVER = "https://dblp.example.com"
+DBLP_HOST = "0.0.0.0"
+DBLP_PORT = 8765
 DBLP_TOKEN = "change-me"
 DBLP_UPDATE_HOUR = 3
 DB_PATH = ROOT_DIR
@@ -24,11 +26,13 @@ DB_PATH = ROOT_DIR
 Settings:
 
 - `DBLP_SERVER`: Base URL of your private DBLP search server.
+- `DBLP_HOST`: Host interface for `make server` / `server.py` to bind.
+- `DBLP_PORT`: Port for `make server` / `server.py` to bind. If omitted, it is derived from `DBLP_SERVER`.
 - `DBLP_TOKEN`: Shared bearer token for protected server endpoints.
 - `DBLP_UPDATE_HOUR`: Local server hour for the daily DBLP update.
 - `DB_PATH`: Directory containing `dblp.xml.gz` and `dblp.xml.gz.idx.sqlite3`. By default, this is the directory containing `settings.py`.
 
-For machine-specific values, create an ignored `settings_local.py` with the same variables, or set environment variables such as `DBLP_SERVER` and `DBLP_TOKEN`.
+For machine-specific values, create an ignored `settings_local.py` with the same variables, or set environment variables such as `DBLP_SERVER`, `DBLP_PORT`, and `DBLP_TOKEN`.
 
 The derived database files are:
 
