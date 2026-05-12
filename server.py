@@ -68,7 +68,7 @@ class DblpService:
                 metadata = dblp.read_index_metadata(connection)
                 if metadata.get("schema_version") != str(dblp.INDEX_SCHEMA_VERSION):
                     raise RuntimeError("index schema is stale")
-                citekeys = dblp.find_match_keys_in_index(connection, title)[:limit]
+                citekeys = dblp.find_match_keys_in_index(connection, title, limit)
                 records = dblp.cached_records(connection, citekeys)
                 bibtex_by_key = dblp.indexed_bibtex(connection, citekeys)
             finally:
@@ -152,6 +152,22 @@ class DblpService:
                 "metadata": metadata,
                 "record_count": record_count,
             }
+
+    def index_status(self) -> tuple[bool, str]:
+        if not os.path.exists(self.index_path):
+            return False, f"missing: {self.index_path}"
+        try:
+            connection = dblp.connect_index(self.index_path, readonly=True)
+            try:
+                metadata = dblp.read_index_metadata(connection)
+                schema_version = metadata.get("schema_version")
+            finally:
+                connection.close()
+        except Exception as exc:
+            return False, f"unreadable: {exc}"
+        if schema_version != str(dblp.INDEX_SCHEMA_VERSION):
+            return False, f"schema version {schema_version}, expected {dblp.INDEX_SCHEMA_VERSION}"
+        return True, self.index_path
 
     def stream_compressed_index(self, output) -> None:
         with self.lock:
@@ -402,12 +418,13 @@ def main() -> int:
         update_hour=update_hour,
     )
 
-    if os.path.exists(index_path):
-        log(f"DBLP database exists: {index_path}")
+    index_ok, index_status = service.index_status()
+    if index_ok:
+        log(f"DBLP database ready: {index_status}")
     elif args.no_initial_update:
-        log(f"DBLP database missing and initial update disabled: {index_path}")
+        log(f"DBLP database not ready and initial update disabled: {index_status}")
     else:
-        log(f"DBLP database missing, running initial update before serving: {index_path}")
+        log(f"DBLP database not ready, running initial update before serving: {index_status}")
         service.last_update = service.update_once()
         if not service.last_update.get("ok"):
             log("Initial DBLP update failed; server will not start")

@@ -85,7 +85,7 @@ DEFAULT_XML_URLS = [
     "https://dblp.org/xml/dblp.xml.gz",
     "https://dblp.uni-trier.de/xml/dblp.xml.gz",
 ]
-INDEX_SCHEMA_VERSION = 5
+INDEX_SCHEMA_VERSION = 6
 REQUEST_TIMEOUT = 20
 XML_FILENAME = "dblp.xml.gz"
 
@@ -390,7 +390,6 @@ def initialize_index(connection: sqlite3.Connection) -> None:
             content='records',
             content_rowid='rowid',
             tokenize='trigram',
-            detail='none',
             columnsize=0
         );
 
@@ -527,7 +526,6 @@ def rebuild_index_with_metadata_path(
             content='records',
             content_rowid='rowid',
             tokenize='trigram',
-            detail='none',
             columnsize=0
         )
         """
@@ -737,7 +735,7 @@ def query_local_index(index_path: str, query: str, limit: int) -> Dict[str, Any]
         metadata = read_index_metadata(connection)
         if metadata.get("schema_version") != str(INDEX_SCHEMA_VERSION):
             raise RuntimeError("local index schema is stale")
-        citekeys = find_match_keys_in_index(connection, query)[:limit]
+        citekeys = find_match_keys_in_index(connection, query, limit)
         records = cached_records(connection, citekeys)
         bibtex_by_key = indexed_bibtex(connection, citekeys)
     finally:
@@ -857,28 +855,49 @@ def pull_index_from_server() -> int:
             pass
 
 
-def find_match_keys_in_index(connection: sqlite3.Connection, title_query: str) -> List[str]:
+def fts5_quote(value: str) -> str:
+    return f'"{value.replace(chr(34), chr(34) * 2)}"'
+
+
+def fts5_title_rows(connection: sqlite3.Connection, query: str, limit: int) -> List[tuple[str]]:
+    return connection.execute(
+        """
+        SELECT records.citekey
+        FROM title_fts
+        JOIN records ON records.rowid = title_fts.rowid
+        WHERE title_fts.normalized_title MATCH ?
+        ORDER BY bm25(title_fts)
+        LIMIT ?
+        """,
+        (query, limit),
+    ).fetchall()
+
+
+def find_match_keys_in_index(connection: sqlite3.Connection, title_query: str, limit: int = 10) -> List[str]:
     target = normalize_title(title_query)
     if not target:
         return []
 
     exact_rows = connection.execute(
-        "SELECT citekey FROM records WHERE normalized_title = ? LIMIT 10",
-        (target,),
+        "SELECT citekey FROM records WHERE normalized_title = ? LIMIT ?",
+        (target, limit),
     ).fetchall()
     if exact_rows:
         return [row[0] for row in exact_rows]
 
-    fallback_rows = connection.execute(
-        """
-        SELECT records.citekey
-        FROM title_fts
-        JOIN records ON records.rowid = title_fts.rowid
-        WHERE title_fts.normalized_title LIKE ?
-        LIMIT 10
-        """,
-        (f"%{target}%",),
-    ).fetchall()
+    fallback_rows = fts5_title_rows(connection, fts5_quote(target), limit)
+    if fallback_rows:
+        return [row[0] for row in fallback_rows]
+
+    tokens = [token for token in re.split(r"\s+", target) if len(token) >= 3]
+    if not tokens:
+        return []
+
+    fallback_rows = fts5_title_rows(
+        connection,
+        " AND ".join(fts5_quote(token) for token in tokens),
+        limit,
+    )
     return [row[0] for row in fallback_rows]
 
 
