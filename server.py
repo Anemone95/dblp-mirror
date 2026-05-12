@@ -191,12 +191,12 @@ class DblpService:
 
         try:
             log(f"Starting DBLP update: xml={self.xml_path}, index={self.index_path}")
-            used_url = dblp.download_with_fallback(dblp.DEFAULT_XML_URLS, tmp_xml)
+            used_url = dblp.download_with_fallback(dblp.DEFAULT_XML_URLS, tmp_xml, progress_callback=log)
             log(f"Downloaded DBLP XML from {used_url}")
             connection = dblp.connect_index(tmp_index)
             try:
                 dblp.initialize_index(connection)
-                dblp.rebuild_index_with_metadata_path(connection, tmp_xml, self.xml_path)
+                dblp.rebuild_index_with_metadata_path(connection, tmp_xml, self.xml_path, progress_callback=log)
             finally:
                 connection.close()
 

@@ -11,12 +11,13 @@ import re
 import sqlite3
 import sys
 import tempfile
+import time
 import urllib.error
 import textwrap
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from typing import Any, Dict, Iterable, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
 from config import CONFIG
 
@@ -435,16 +436,36 @@ def index_is_fresh(
     return all(metadata.get(key) == value for key, value in expected.items())
 
 
-def rebuild_index(connection: sqlite3.Connection, xml_gz_path: str) -> None:
-    rebuild_index_with_metadata_path(connection, xml_gz_path, xml_gz_path)
+ProgressCallback = Callable[[str], None]
+
+
+def format_bytes(value: int) -> str:
+    units = ("B", "KiB", "MiB", "GiB")
+    size = float(value)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{size:.1f} {unit}" if unit != "B" else f"{value} B"
+        size /= 1024
+    return f"{value} B"
+
+
+def rebuild_index(
+    connection: sqlite3.Connection,
+    xml_gz_path: str,
+    progress_callback: Optional[ProgressCallback] = None,
+) -> None:
+    rebuild_index_with_metadata_path(connection, xml_gz_path, xml_gz_path, progress_callback=progress_callback)
 
 
 def rebuild_index_with_metadata_path(
     connection: sqlite3.Connection,
     xml_gz_path: str,
     metadata_xml_gz_path: str,
+    progress_callback: Optional[ProgressCallback] = None,
 ) -> None:
     stat_result = os.stat(xml_gz_path)
+    if progress_callback:
+        progress_callback(f"Building SQLite index from {format_bytes(stat_result.st_size)} DBLP XML")
     connection.execute("PRAGMA journal_mode=OFF")
     connection.execute("PRAGMA synchronous=OFF")
     connection.execute("PRAGMA temp_store=MEMORY")
@@ -463,6 +484,7 @@ def rebuild_index_with_metadata_path(
 
     rows: List[tuple[str, str, str]] = []
     batch_size = 20000
+    record_count = 0
 
     def flush_rows() -> None:
         if rows:
@@ -473,11 +495,16 @@ def rebuild_index_with_metadata_path(
             rows.clear()
 
     for normalized_title, citekey, record_xml in iter_index_entries(xml_gz_path):
+        record_count += 1
         rows.append((normalized_title, citekey, record_xml))
         if len(rows) >= batch_size:
             flush_rows()
+        if progress_callback and record_count % 100000 == 0:
+            progress_callback(f"Building SQLite index: inserted {record_count:,} records")
 
     flush_rows()
+    if progress_callback:
+        progress_callback(f"Building SQLite index: inserted {record_count:,} records; creating B-tree indexes")
     connection.execute(
         """
         CREATE INDEX idx_records_normalized_title
@@ -490,6 +517,8 @@ def rebuild_index_with_metadata_path(
         ON records(citekey)
         """
     )
+    if progress_callback:
+        progress_callback("Building SQLite index: creating FTS index")
     connection.execute(
         """
         CREATE VIRTUAL TABLE title_fts
@@ -512,6 +541,8 @@ def rebuild_index_with_metadata_path(
     )
     connection.commit()
     connection.execute("PRAGMA synchronous=NORMAL")
+    if progress_callback:
+        progress_callback(f"Building SQLite index complete: {record_count:,} records")
 
 
 def open_fresh_index(xml_gz_path: str, index_path: str) -> sqlite3.Connection:
@@ -541,7 +572,11 @@ def remove_sqlite_sidecars(index_path: str) -> None:
             pass
 
 
-def rebuild_index_for_paths(xml_gz_path: str, index_path: str) -> None:
+def rebuild_index_for_paths(
+    xml_gz_path: str,
+    index_path: str,
+    progress_callback: Optional[ProgressCallback] = None,
+) -> None:
     index_dir = os.path.dirname(os.path.abspath(index_path)) or "."
     os.makedirs(index_dir, exist_ok=True)
     fd, tmp_index_path = tempfile.mkstemp(
@@ -554,7 +589,7 @@ def rebuild_index_for_paths(xml_gz_path: str, index_path: str) -> None:
     connection = connect_index(tmp_index_path)
     try:
         initialize_index(connection)
-        rebuild_index(connection, xml_gz_path)
+        rebuild_index(connection, xml_gz_path, progress_callback=progress_callback)
         connection.close()
         remove_sqlite_sidecars(index_path)
         os.replace(tmp_index_path, index_path)
@@ -856,7 +891,11 @@ def find_match_keys(xml_gz_path: str, title_query: str, index_path: Optional[str
         connection.close()
 
 
-def download_file(url: str, destination: str) -> None:
+def download_file(
+    url: str,
+    destination: str,
+    progress_callback: Optional[ProgressCallback] = None,
+) -> None:
     destination_dir = os.path.dirname(os.path.abspath(destination)) or "."
     os.makedirs(destination_dir, exist_ok=True)
 
@@ -870,11 +909,33 @@ def download_file(url: str, destination: str) -> None:
     try:
         request = urllib.request.Request(url, headers={"User-Agent": "dblp-cli/1.0"})
         with urllib.request.urlopen(request) as response, open(tmp_path, "wb") as out:
+            total_size_text = response.headers.get("Content-Length")
+            total_size = int(total_size_text) if total_size_text and total_size_text.isdigit() else None
+            downloaded = 0
+            last_report = 0.0
+            if progress_callback:
+                progress_callback(
+                    f"Downloading DBLP XML from {url}"
+                    + (f" ({format_bytes(total_size)})" if total_size is not None else "")
+                )
             while True:
                 chunk = response.read(1024 * 1024)
                 if not chunk:
                     break
+                downloaded += len(chunk)
                 out.write(chunk)
+                now = time.monotonic()
+                if progress_callback and now - last_report >= 5:
+                    last_report = now
+                    if total_size is None:
+                        progress_callback(f"Downloading DBLP XML: {format_bytes(downloaded)}")
+                    else:
+                        percent = downloaded * 100 / total_size
+                        progress_callback(
+                            f"Downloading DBLP XML: {format_bytes(downloaded)} / {format_bytes(total_size)} ({percent:.1f}%)"
+                        )
+            if progress_callback:
+                progress_callback(f"Downloading DBLP XML complete: {format_bytes(downloaded)}")
         os.replace(tmp_path, destination)
     except Exception:
         try:
@@ -884,11 +945,15 @@ def download_file(url: str, destination: str) -> None:
         raise
 
 
-def download_with_fallback(urls: List[str], destination: str) -> str:
+def download_with_fallback(
+    urls: List[str],
+    destination: str,
+    progress_callback: Optional[ProgressCallback] = None,
+) -> str:
     errors = []
     for url in urls:
         try:
-            download_file(url, destination)
+            download_file(url, destination, progress_callback=progress_callback)
             return url
         except Exception as exc:
             errors.append(f"{url}: {exc}")
@@ -938,6 +1003,7 @@ def cmd_pull(args: argparse.Namespace) -> int:
 
 def cmd_update(args: argparse.Namespace) -> int:
     index_path = args.index or default_index_path(args.output)
+    progress = lambda message: print(message, file=sys.stderr)
     if args.no_download:
         if not os.path.exists(args.output):
             print(f"XML file not found: {args.output}", file=sys.stderr)
@@ -945,13 +1011,13 @@ def cmd_update(args: argparse.Namespace) -> int:
         used_url = None
     else:
         try:
-            used_url = download_with_fallback(DEFAULT_XML_URLS, args.output)
+            used_url = download_with_fallback(DEFAULT_XML_URLS, args.output, progress_callback=progress)
         except Exception as exc:
             print(f"Failed to download update file: {exc}", file=sys.stderr)
             return 1
 
     try:
-        rebuild_index_for_paths(args.output, index_path)
+        rebuild_index_for_paths(args.output, index_path, progress_callback=progress)
     except Exception as exc:
         if used_url is None:
             print(f"Failed to build index: {exc}", file=sys.stderr)
