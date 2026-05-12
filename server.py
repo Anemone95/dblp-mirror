@@ -53,11 +53,17 @@ class DblpService:
         self.update_hour = update_hour
         self.lock = threading.RLock()
         self.last_update: Optional[Dict[str, Any]] = None
+        self.update_in_progress = False
 
     def query(self, title: str, limit: int) -> List[Dict[str, Any]]:
         with self.lock:
-            connection = dblp.open_fresh_index(self.xml_path, self.index_path)
+            if not os.path.exists(self.index_path):
+                raise FileNotFoundError(f"DBLP index not found: {self.index_path}")
+            connection = dblp.connect_index(self.index_path, readonly=True)
             try:
+                metadata = dblp.read_index_metadata(connection)
+                if metadata.get("schema_version") != str(dblp.INDEX_SCHEMA_VERSION):
+                    raise RuntimeError("index schema is stale")
                 citekeys = dblp.find_match_keys_in_index(connection, title)[:limit]
                 records = dblp.cached_records(connection, citekeys)
                 bibtex_by_key = dblp.indexed_bibtex(connection, citekeys)
@@ -226,6 +232,26 @@ class DblpService:
                 except FileNotFoundError:
                     pass
 
+    def start_background_update(self) -> bool:
+        with self.lock:
+            if self.update_in_progress:
+                return False
+            self.update_in_progress = True
+            self.last_update = {
+                "started_at": datetime.now().isoformat(timespec="seconds"),
+                "ok": False,
+                "status": "running",
+            }
+
+        def run() -> None:
+            result = self.update_once()
+            with self.lock:
+                self.last_update = result
+                self.update_in_progress = False
+
+        threading.Thread(target=run, daemon=True).start()
+        return True
+
     def run_update_loop(self) -> None:
         while True:
             now = datetime.now()
@@ -293,6 +319,8 @@ def make_handler(service: DblpService) -> type[BaseHTTPRequestHandler]:
 
             try:
                 self.write_json({"items": service.query(query, limit)})
+            except FileNotFoundError as exc:
+                self.write_json({"error": str(exc)}, status=503)
             except Exception as exc:
                 self.write_json({"error": str(exc)}, status=500)
 
@@ -351,6 +379,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Serve queries without starting the daily update thread",
     )
+    parser.add_argument(
+        "--no-initial-update",
+        action="store_true",
+        help="Do not start an immediate background update when the index is missing",
+    )
     return parser
 
 
@@ -369,6 +402,9 @@ def main() -> int:
     if not args.no_scheduler:
         updater = threading.Thread(target=service.run_update_loop, daemon=True)
         updater.start()
+
+    if not args.no_scheduler and not args.no_initial_update and not os.path.exists(index_path):
+        service.start_background_update()
 
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(service))
     print(f"Serving DBLP search on http://{args.host}:{args.port}", file=sys.stderr)

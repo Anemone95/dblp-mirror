@@ -4,16 +4,20 @@ import argparse
 from datetime import datetime
 import gzip
 import html.entities
+import json
 import os
 import re
 import sqlite3
 import sys
 import tempfile
+import urllib.error
 import textwrap
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from typing import Dict, Iterable, Iterator, List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional
+
+import settings
 
 
 PUBLICATION_TAGS = {
@@ -80,6 +84,8 @@ DEFAULT_XML_URLS = [
     "https://dblp.uni-trier.de/xml/dblp.xml.gz",
 ]
 INDEX_SCHEMA_VERSION = 5
+REQUEST_TIMEOUT = 20
+XML_FILENAME = "dblp.xml.gz"
 
 
 def normalize_title(title: str) -> str:
@@ -611,6 +617,191 @@ def indexed_bibtex(connection: sqlite3.Connection, citekeys: List[str]) -> Dict[
     return bibtex_by_key
 
 
+def alfred_items(message: str, subtitle: str = "", *, valid: bool = False) -> Dict[str, Any]:
+    return {
+        "items": [
+            {
+                "title": message,
+                "subtitle": subtitle,
+                "valid": valid,
+            }
+        ]
+    }
+
+
+def request_url(
+    server: str,
+    path: str,
+    token: str,
+    query: Optional[Dict[str, str]] = None,
+) -> urllib.request.Request:
+    url = f"{server.rstrip('/')}{path}"
+    if query:
+        url = f"{url}?{urllib.parse.urlencode(query)}"
+    request = urllib.request.Request(url)
+    if token:
+        request.add_header("Authorization", f"Bearer {token}")
+    return request
+
+
+def query_server(server: str, token: str, query: str, limit: int) -> Dict[str, Any]:
+    request = request_url(server, "/query", token, {"q": query, "limit": str(limit)})
+    with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def record_items(
+    records: Dict[str, Dict[str, object]],
+    bibtex_by_key: Dict[str, str],
+    citekeys: Iterable[str],
+) -> List[Dict[str, Any]]:
+    items = []
+    for citekey in citekeys:
+        record = records.get(citekey)
+        bibtex = bibtex_by_key.get(citekey)
+        if record is None or bibtex is None:
+            continue
+
+        authors = record.get("author", [])
+        if isinstance(authors, str):
+            author_text = authors
+        elif isinstance(authors, list):
+            author_text = ", ".join(str(author) for author in authors[:8])
+            if len(authors) > 8:
+                author_text += ", ..."
+        else:
+            author_text = ""
+
+        year = record.get("year")
+        subtitle_parts = [part for part in (author_text, str(year) if year else "") if part]
+        items.append(
+            {
+                "title": str(record.get("title", citekey)),
+                "subtitle": " | ".join(subtitle_parts),
+                "citekey": citekey,
+                "bibtex": bibtex,
+                "arg": bibtex,
+            }
+        )
+    return items
+
+
+def query_local_index(index_path: str, query: str, limit: int) -> Dict[str, Any]:
+    connection = connect_index(index_path, readonly=True)
+    try:
+        metadata = read_index_metadata(connection)
+        if metadata.get("schema_version") != str(INDEX_SCHEMA_VERSION):
+            raise RuntimeError("local index schema is stale")
+        citekeys = find_match_keys_in_index(connection, query)[:limit]
+        records = cached_records(connection, citekeys)
+        bibtex_by_key = indexed_bibtex(connection, citekeys)
+    finally:
+        connection.close()
+    return {"items": record_items(records, bibtex_by_key, citekeys)}
+
+
+def configured_index_path(file_path: Optional[str] = None, index_path: Optional[str] = None) -> str:
+    if index_path:
+        return index_path
+
+    if file_path:
+        return default_index_path(file_path)
+
+    db_path = os.environ.get("DB_PATH", settings.DB_PATH)
+    return default_index_path(os.path.join(db_path, XML_FILENAME))
+
+
+def query_with_fallback(
+    query: str,
+    limit: int,
+    *,
+    file_path: Optional[str] = None,
+    index_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    resolved_index_path = configured_index_path(file_path, index_path)
+    if resolved_index_path and os.path.exists(resolved_index_path):
+        try:
+            return query_local_index(resolved_index_path, query, limit)
+        except Exception as exc:
+            print(f"Local DBLP index failed, falling back to server: {exc}", file=sys.stderr)
+
+    server = os.environ.get("DBLP_SERVER", settings.DBLP_SERVER).strip()
+    token = os.environ.get("DBLP_TOKEN", settings.DBLP_TOKEN)
+    if not server:
+        return alfred_items("DBLP server is not configured", "Set DBLP_SERVER in settings.py")
+
+    try:
+        payload = query_server(server, token, query, limit)
+    except urllib.error.HTTPError as exc:
+        detail = exc.reason
+        try:
+            error_payload = json.loads(exc.read().decode("utf-8"))
+            if isinstance(error_payload, dict) and error_payload.get("error"):
+                detail = str(error_payload["error"])
+        except Exception:
+            pass
+        return alfred_items(f"DBLP server error: HTTP {exc.code}", detail)
+    except Exception as exc:
+        return alfred_items(f"DBLP server error: {exc}", "Check settings.py")
+
+    if "error" in payload and "items" not in payload:
+        return alfred_items(f"DBLP server error: {payload['error']}", "Try again later")
+    return {"items": payload.get("items", [])}
+
+
+def pull_index_from_server() -> int:
+    server = os.environ.get("DBLP_SERVER", settings.DBLP_SERVER).strip()
+    token = os.environ.get("DBLP_TOKEN", settings.DBLP_TOKEN)
+    index_path = configured_index_path()
+    if not server:
+        print("DBLP_SERVER is not configured in settings.py", file=sys.stderr)
+        return 2
+    if not index_path:
+        print("DB_PATH is not configured in settings.py", file=sys.stderr)
+        return 2
+
+    index_dir = os.path.dirname(os.path.abspath(index_path)) or "."
+    os.makedirs(index_dir, exist_ok=True)
+    fd, tmp_index = tempfile.mkstemp(
+        prefix=f".{os.path.basename(index_path)}.",
+        suffix=".tmp",
+        dir=index_dir,
+    )
+    os.close(fd)
+
+    try:
+        request = request_url(server, "/index.gz", token)
+        with urllib.request.urlopen(request, timeout=None) as response, gzip.GzipFile(fileobj=response, mode="rb") as compressed, open(tmp_index, "wb") as output:
+            while True:
+                chunk = compressed.read(1024 * 1024)
+                if not chunk:
+                    break
+                output.write(chunk)
+
+        connection = sqlite3.connect(tmp_index)
+        try:
+            quick_check = connection.execute("PRAGMA quick_check").fetchone()[0]
+            if quick_check != "ok":
+                raise RuntimeError(f"downloaded index failed quick_check: {quick_check}")
+            metadata = read_index_metadata(connection)
+            if metadata.get("schema_version") != str(INDEX_SCHEMA_VERSION):
+                raise RuntimeError("downloaded index schema is stale")
+        finally:
+            connection.close()
+
+        os.replace(tmp_index, index_path)
+        print(f"Pulled DBLP index to {index_path} ({os.path.getsize(index_path)} bytes)")
+        return 0
+    except Exception as exc:
+        print(f"Failed to pull DBLP index: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        try:
+            os.unlink(tmp_index)
+        except FileNotFoundError:
+            pass
+
+
 def find_match_keys_in_index(connection: sqlite3.Connection, title_query: str) -> List[str]:
     target = normalize_title(title_query)
     if not target:
@@ -686,44 +877,43 @@ def download_with_fallback(urls: List[str], destination: str) -> str:
 
 
 def cmd_query(args: argparse.Namespace) -> int:
-    xml_gz_path = args.file
-    index_path = args.index or default_index_path(xml_gz_path)
-    if not os.path.exists(xml_gz_path):
-        print(f"XML file not found: {xml_gz_path}", file=sys.stderr)
-        return 2
+    title = " ".join(args.title).strip()
+    if not title or len(title) < 2:
+        print(json.dumps(alfred_items("Finding papers on DBLP", "Please type at least 2 characters"), ensure_ascii=False))
+        return 0
 
-    try:
-        connection = open_fresh_index(xml_gz_path, index_path)
-    except Exception as exc:
-        print(f"Failed to open local query index: {exc}", file=sys.stderr)
-        return 1
+    limit = max(1, min(args.limit, 50))
+    payload = query_with_fallback(
+        title,
+        limit,
+        file_path=args.file,
+        index_path=args.index,
+    )
+    items = payload.get("items", [])
 
-    try:
-        match_keys = find_match_keys_in_index(connection, args.title)
-        if not match_keys:
+    if args.bibtex:
+        bibtex_items = [str(item["bibtex"]) for item in items if isinstance(item, dict) and item.get("bibtex")]
+        if not bibtex_items:
+            if items and isinstance(items[0], dict) and items[0].get("valid") is False:
+                title_text = str(items[0].get("title", "DBLP query failed"))
+                subtitle_text = str(items[0].get("subtitle", ""))
+                print(f"{title_text}: {subtitle_text}".rstrip(": "), file=sys.stderr)
+                return 1
             print("No matching title found.", file=sys.stderr)
             return 1
+        print("\n\n".join(bibtex_items))
+        return 0
 
-        bibtex_by_key = indexed_bibtex(connection, match_keys)
-        missing_keys = [citekey for citekey in match_keys if citekey not in bibtex_by_key]
-        if missing_keys:
-            print(
-                f"Matched title, but record not found in local index: {', '.join(missing_keys)}",
-                file=sys.stderr,
-            )
-            return 1
-
-        for index, citekey in enumerate(match_keys):
-            if index:
-                print()
-            print(bibtex_by_key[citekey])
-    except Exception as exc:
-        print(f"Failed to read BibTeX from local mirror: {exc}", file=sys.stderr)
-        return 1
-    finally:
-        connection.close()
-
+    print(json.dumps(payload if args.raw else {"items": items}, ensure_ascii=False))
     return 0
+
+
+def cmd_pull(args: argparse.Namespace) -> int:
+    try:
+        return pull_index_from_server()
+    except KeyboardInterrupt:
+        print("Interrupted while pulling DBLP index.", file=sys.stderr)
+        return 1
 
 
 def cmd_update(args: argparse.Namespace) -> int:
@@ -761,21 +951,31 @@ def cmd_update(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     default_xml = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dblp.xml.gz")
     parser = argparse.ArgumentParser(prog="dblp")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument("--raw", action="store_true", help="Print the full response payload")
+    subparsers = parser.add_subparsers(dest="command")
 
-    query_parser = subparsers.add_parser("query", help="Query BibTeX by title from dblp.xml.gz")
-    query_parser.add_argument("title", help="Publication title to search for")
+    query_parser = subparsers.add_parser("query", help="Query DBLP by title")
+    query_parser.add_argument("title", nargs="*", help="Publication title to search for")
+    query_parser.add_argument("--limit", type=int, default=10, help="Maximum number of results")
     query_parser.add_argument(
         "--file",
-        default=default_xml,
-        help="Path to dblp.xml.gz (default: %(default)s)",
+        default=None,
+        help="Path used to derive the local SQLite index path (default: DB_PATH/dblp.xml.gz)",
     )
     query_parser.add_argument(
         "--index",
         default=None,
         help="Path to the local SQLite query index (default: <file>.idx.sqlite3)",
     )
+    query_parser.add_argument("--raw", action="store_true", help="Print the full response payload")
+    query_parser.add_argument("--bibtex", action="store_true", help="Print matching BibTeX entries")
     query_parser.set_defaults(func=cmd_query)
+
+    pull_parser = subparsers.add_parser(
+        "pull",
+        help="Download the completed SQLite index from the configured DBLP server",
+    )
+    pull_parser.set_defaults(func=cmd_pull)
 
     update_parser = subparsers.add_parser(
         "update",
@@ -803,7 +1003,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(list(argv) if argv is not None else None)
+    parsed_argv = list(argv) if argv is not None else sys.argv[1:]
+    if parsed_argv and parsed_argv[0] not in {"query", "pull", "update", "--raw", "-h", "--help"}:
+        parsed_argv = ["query", *parsed_argv]
+    args = parser.parse_args(parsed_argv)
+    if args.command is None:
+        args = parser.parse_args(["query"])
     return args.func(args)
 
 

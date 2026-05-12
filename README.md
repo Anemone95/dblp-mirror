@@ -28,6 +28,8 @@ Settings:
 - `DBLP_UPDATE_HOUR`: Local server hour for the daily DBLP update.
 - `DB_PATH`: Directory containing `dblp.xml.gz` and `dblp.xml.gz.idx.sqlite3`. By default, this is the directory containing `settings.py`.
 
+For machine-specific values, create an ignored `settings_local.py` with the same variables, or set environment variables such as `DBLP_SERVER` and `DBLP_TOKEN`.
+
 The derived database files are:
 
 - XML mirror: `<DB_PATH>/dblp.xml.gz`
@@ -42,6 +44,7 @@ make server
 ```
 
 `make server` runs `server.py` through `run_server.py`, a small foreground supervisor that restarts the server if it exits.
+If the SQLite index is missing at startup, the server starts one background update immediately. Until that update finishes, `/health` reports `ok: false` and `/query` returns HTTP 503 with the missing index path.
 
 Server endpoints:
 
@@ -58,7 +61,7 @@ The scheduled update downloads DBLP XML to a temporary file, builds a temporary 
 Query from the command line:
 
 ```bash
-python3 client.py "Attention is All you Need"
+./dblp query "Attention is All you Need"
 ```
 
 Pull the completed database from the configured server:
@@ -67,7 +70,7 @@ Pull the completed database from the configured server:
 make update
 ```
 
-`make update` runs `python3 client.py pull`. It downloads `/index.gz`, decompresses it, verifies SQLite `PRAGMA quick_check`, checks the schema version, and atomically replaces the local index.
+`make update` runs `./dblp pull`. It downloads `/index.gz`, decompresses it, verifies SQLite `PRAGMA quick_check`, checks the schema version, and atomically replaces the local index.
 
 Query behavior:
 

@@ -10,7 +10,7 @@ server:
 	python3 run_server.py --host 0.0.0.0 --port 8765
 
 update:
-	python3 client.py pull
+	./dblp pull
 
 workflow: $(OUTPUT_FILE)
 
