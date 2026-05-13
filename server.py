@@ -16,7 +16,7 @@ import time
 import traceback
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, List, Optional
+from typing import Any, BinaryIO, Dict, List, Optional
 
 from config import CONFIG
 
@@ -169,9 +169,13 @@ class DblpService:
             return False, f"schema version {schema_version}, expected {dblp.INDEX_SCHEMA_VERSION}"
         return True, self.index_path
 
-    def stream_compressed_index(self, output) -> None:
+    def open_index_snapshot(self) -> tuple[BinaryIO, int]:
         with self.lock:
             source = open(self.index_path, "rb")
+            size = os.fstat(source.fileno()).st_size
+        return source, size
+
+    def stream_compressed_index(self, source: BinaryIO, output) -> None:
         with source, gzip.GzipFile(fileobj=output, mode="wb", compresslevel=6) as compressed:
             while True:
                 chunk = source.read(1024 * 1024)
@@ -310,12 +314,18 @@ def make_handler(service: DblpService) -> type[BaseHTTPRequestHandler]:
                 if not self.authorized(params):
                     self.write_json({"error": "unauthorized"}, status=401)
                     return
+                try:
+                    source, index_size = service.open_index_snapshot()
+                except OSError as exc:
+                    self.write_json({"error": str(exc)}, status=503)
+                    return
                 self.send_response(200)
                 self.send_header("Content-Type", "application/gzip")
                 self.send_header("Content-Disposition", 'attachment; filename="dblp.xml.gz.idx.sqlite3.gz"')
+                self.send_header("X-DBLP-Index-Size", str(index_size))
                 self.end_headers()
                 try:
-                    service.stream_compressed_index(self.wfile)
+                    service.stream_compressed_index(source, self.wfile)
                 except BrokenPipeError:
                     pass
                 return

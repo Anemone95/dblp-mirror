@@ -848,13 +848,45 @@ def pull_index_from_server() -> int:
 
     try:
         request = request_url(server, "/index.gz", token)
-        with urllib.request.urlopen(request, timeout=None) as response, gzip.GzipFile(fileobj=response, mode="rb") as compressed, open(tmp_index, "wb") as output:
+        print(f"Pulling DBLP index from {server.rstrip('/')}/index.gz", file=sys.stderr)
+        with (
+            urllib.request.urlopen(request, timeout=None) as response,
+            gzip.GzipFile(fileobj=response, mode="rb") as compressed,
+            open(tmp_index, "wb") as output,
+        ):
+            total_size_text = response.headers.get("X-DBLP-Index-Size")
+            if not total_size_text or not total_size_text.isdigit():
+                raise RuntimeError("server response is missing X-DBLP-Index-Size")
+            total_size = int(total_size_text)
+            if total_size <= 0:
+                raise RuntimeError("server response has invalid X-DBLP-Index-Size")
+
+            downloaded = 0
+            last_report = 0.0
             while True:
                 chunk = compressed.read(1024 * 1024)
                 if not chunk:
                     break
+                downloaded += len(chunk)
                 output.write(chunk)
+                now = time.monotonic()
+                if now - last_report >= 5:
+                    last_report = now
+                    percent = min(downloaded * 100 / total_size, 100)
+                    print(
+                        f"Pulling DBLP index: {format_bytes(downloaded)} / {format_bytes(total_size)} ({percent:.1f}%)",
+                        file=sys.stderr,
+                    )
+            if downloaded != total_size:
+                raise RuntimeError(
+                    f"downloaded index size mismatch: expected {format_bytes(total_size)}, received {format_bytes(downloaded)}"
+                )
+            print(
+                f"Pulling DBLP index complete: {format_bytes(downloaded)} / {format_bytes(total_size)}",
+                file=sys.stderr,
+            )
 
+        print("Verifying downloaded DBLP index", file=sys.stderr)
         connection = sqlite3.connect(tmp_index)
         try:
             quick_check = connection.execute("PRAGMA quick_check").fetchone()[0]

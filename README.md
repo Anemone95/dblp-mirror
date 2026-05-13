@@ -71,6 +71,7 @@ make update
 ```
 
 `make update` runs `./dblp pull`. It downloads `/index.gz`, decompresses it, verifies SQLite `PRAGMA quick_check`, checks the schema version, and atomically replaces the local index.
+During the pull, it prints download progress to stderr and then reports the verification step before replacing the local index.
 
 Query behavior:
 
