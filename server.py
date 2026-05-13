@@ -153,9 +153,9 @@ class DblpService:
                 "record_count": record_count,
             }
 
-    def index_status(self) -> tuple[bool, str]:
+    def index_status(self) -> tuple[bool, str, str]:
         if not os.path.exists(self.index_path):
-            return False, f"missing: {self.index_path}"
+            return False, "missing", f"missing: {self.index_path}"
         try:
             connection = dblp.connect_index(self.index_path, readonly=True)
             try:
@@ -164,10 +164,10 @@ class DblpService:
             finally:
                 connection.close()
         except Exception as exc:
-            return False, f"unreadable: {exc}"
+            return False, "unreadable", f"unreadable: {exc}"
         if schema_version != str(dblp.INDEX_SCHEMA_VERSION):
-            return False, f"schema version {schema_version}, expected {dblp.INDEX_SCHEMA_VERSION}"
-        return True, self.index_path
+            return False, "stale", f"schema version {schema_version}, expected {dblp.INDEX_SCHEMA_VERSION}"
+        return True, "ready", self.index_path
 
     def open_index_snapshot(self) -> tuple[BinaryIO, int]:
         with self.lock:
@@ -433,11 +433,16 @@ def main() -> int:
         update_hour=update_hour,
     )
 
-    index_ok, index_status = service.index_status()
+    index_ok, index_state, index_status = service.index_status()
     if index_ok:
         log(f"DBLP database ready: {index_status}")
     elif args.no_initial_update:
         log(f"DBLP database not ready and initial update disabled: {index_status}")
+    elif index_state != "missing":
+        log(f"DBLP database exists but is not usable: {index_status}")
+        log("Refusing to run initial update automatically because this would replace an existing database.")
+        log("Fix the existing index, move it aside, or trigger a manual update when replacement is intended.")
+        return 1
     else:
         log(f"DBLP database not ready, running initial update before serving: {index_status}")
         service.last_update = service.update_once()
